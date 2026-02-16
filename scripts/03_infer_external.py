@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from collections import deque
 from pathlib import Path
 import sys
 
@@ -14,6 +15,21 @@ from src.config import (
     BG_VALUE,
     CONF_THRES,
     EXTERNAL_FRAMES_DIR,
+    HORIZON_EMA_ALPHA,
+    HORIZON_ENABLE,
+    HORIZON_GATE_MAX_DELTA_RATIO,
+    HORIZON_GATE_MIN_DELTA_RATIO,
+    HORIZON_MAX_MISS,
+    HORIZON_MAX_SLOPE_DEG,
+    HORIZON_MAX_STEP_RATIO,
+    HORIZON_MAX_Y_RATIO,
+    HORIZON_MEDIAN_WIN,
+    HORIZON_TOP_MAX_RATIO,
+    HORIZON_TOP_MIN_RATIO,
+    HORIZON_MIN_CONF,
+    HORIZON_MIN_LINE_LEN_RATIO,
+    HORIZON_RESIZE_W,
+    HORIZON_TOP_MARGIN_RATIO,
     HYBRID_DIR,
     IMGSZ,
     IOU_THRES,
@@ -26,16 +42,17 @@ from src.config import (
     ROI_TOP_RIGHT_X_RATIO,
     ROI_TOP_Y_RATIO,
     SEED,
+    HORIZON_UPDATE_INTERVAL,
 )
 from src.io_yolo import write_yolo_txt
 
 
-def make_mask(width: int, height: int) -> np.ndarray:
+def make_mask(width: int, height: int, top_y_ratio: float) -> np.ndarray:
     roi_polygon = np.array(
         [
             # top trapezoid edge
-            [int(width * ROI_TOP_LEFT_X_RATIO), int(height * ROI_TOP_Y_RATIO)],
-            [int(width * ROI_TOP_RIGHT_X_RATIO), int(height * ROI_TOP_Y_RATIO)],
+            [int(width * ROI_TOP_LEFT_X_RATIO), int(height * top_y_ratio)],
+            [int(width * ROI_TOP_RIGHT_X_RATIO), int(height * top_y_ratio)],
             # connect to bottom rectangle
             [int(width * ROI_BOTTOM_RIGHT_X_RATIO), int(height * ROI_MID_Y_RATIO)],
             [int(width * ROI_BOTTOM_RIGHT_X_RATIO), int(height * ROI_BOTTOM_Y_RATIO)],
@@ -48,8 +65,8 @@ def make_mask(width: int, height: int) -> np.ndarray:
     cv2.fillPoly(mask, [roi_polygon], 255)
 
     # Hard crop outside vertical ROI span:
-    # everything above ROI_TOP_Y_RATIO and below ROI_BOTTOM_Y_RATIO is removed.
-    y_top = int(np.clip(height * ROI_TOP_Y_RATIO, 0, height - 1))
+    # everything above dynamic top_y and below ROI_BOTTOM_Y_RATIO is removed.
+    y_top = int(np.clip(height * top_y_ratio, 0, height - 1))
     y_bottom = int(np.clip(height * ROI_BOTTOM_Y_RATIO, 0, height))
     if y_bottom <= y_top:
         y_bottom = min(height, y_top + 1)
@@ -58,6 +75,85 @@ def make_mask(width: int, height: int) -> np.ndarray:
     if y_bottom < height:
         mask[y_bottom:, :] = 0
     return mask
+
+
+def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    if values.size == 0:
+        return float("nan")
+    idx = np.argsort(values)
+    v = values[idx]
+    w = weights[idx]
+    cdf = np.cumsum(w)
+    cutoff = 0.5 * w.sum()
+    return float(v[np.searchsorted(cdf, cutoff)])
+
+
+def estimate_horizon_y(frame: np.ndarray) -> tuple[float, float, bool]:
+    h, w = frame.shape[:2]
+    if w <= 1 or h <= 1:
+        return float(h * ROI_TOP_Y_RATIO), 0.0, False
+
+    scale = HORIZON_RESIZE_W / float(w)
+    nw = HORIZON_RESIZE_W
+    nh = max(2, int(round(h * scale)))
+    img = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 60, 160)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=50,
+        minLineLength=max(10, int(nw * HORIZON_MIN_LINE_LEN_RATIO)),
+        maxLineGap=20,
+    )
+    if lines is None or len(lines) == 0:
+        return float(h * ROI_TOP_Y_RATIO), 0.0, False
+
+    max_slope = np.tan(np.deg2rad(HORIZON_MAX_SLOPE_DEG))
+    max_y = nh * HORIZON_MAX_Y_RATIO
+    ys = []
+    ws = []
+
+    for ln in lines[:, 0, :]:
+        x1, y1, x2, y2 = map(float, ln)
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-6:
+            continue
+        slope = dy / dx
+        if abs(slope) > max_slope:
+            continue
+        y_mid = 0.5 * (y1 + y2)
+        if y_mid > max_y:
+            continue
+        length = float(np.hypot(dx, dy))
+        # Mean edge response near the segment midpoint as a weak quality term.
+        xm = int(np.clip(round(0.5 * (x1 + x2)), 0, nw - 1))
+        ym = int(np.clip(round(y_mid), 0, nh - 1))
+        patch = edges[max(0, ym - 2) : min(nh, ym + 3), max(0, xm - 2) : min(nw, xm + 3)]
+        edge_strength = float(patch.mean() / 255.0) if patch.size > 0 else 0.0
+        weight = length * (0.7 + 0.3 * edge_strength)
+        ys.append(y_mid)
+        ws.append(weight)
+
+    if not ys:
+        return float(h * ROI_TOP_Y_RATIO), 0.0, False
+
+    ys_arr = np.asarray(ys, dtype=np.float32)
+    ws_arr = np.asarray(ws, dtype=np.float32)
+    y_hat_small = weighted_median(ys_arr, ws_arr)
+    y_hat = y_hat_small / scale
+
+    y_std = float(np.std(ys_arr))
+    line_count_term = min(1.0, len(ys_arr) / 20.0)
+    spread_term = max(0.0, 1.0 - y_std / max(1.0, 0.08 * nh))
+    conf = 0.6 * line_count_term + 0.4 * spread_term
+    return float(y_hat), float(np.clip(conf, 0.0, 1.0)), True
 
 
 def to_box_dicts(result) -> list[dict]:
@@ -110,6 +206,9 @@ def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
     lbl_dir = ensure_dir(mode_dir / "labels")
 
     frames = sorted(EXTERNAL_FRAMES_DIR.glob("*.jpg"))
+    y_prev = None
+    miss_count = 0
+    y_hist = deque(maxlen=HORIZON_MEDIAN_WIN)
     for i, p in enumerate(frames, start=1):
         frame = cv2.imread(str(p))
         if frame is None:
@@ -117,7 +216,49 @@ def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
         h, w = frame.shape[:2]
 
         if hybrid:
-            mask = make_mask(w, h)
+            top_ratio = ROI_TOP_Y_RATIO
+            if HORIZON_ENABLE:
+                if y_prev is None:
+                    y_prev = float(h * ROI_TOP_Y_RATIO)
+
+                should_update = (i == 1) or (i % max(1, HORIZON_UPDATE_INTERVAL) == 0)
+                if should_update:
+                    y_raw, conf, ok = estimate_horizon_y(frame)
+                    if ok and conf >= HORIZON_MIN_CONF:
+                        y_hist.append(y_raw)
+                        y_med = float(np.median(np.asarray(y_hist, dtype=np.float32)))
+                        delta_ratio = abs(y_med - y_prev) / max(float(h), 1.0)
+
+                        # Gate 1: deadband (too small changes are treated as noise)
+                        # Gate 2: reject unrealistic jumps.
+                        gated_in = (
+                            delta_ratio >= HORIZON_GATE_MIN_DELTA_RATIO
+                            and delta_ratio <= HORIZON_GATE_MAX_DELTA_RATIO
+                        )
+                        if gated_in:
+                            y_ema = HORIZON_EMA_ALPHA * y_med + (1.0 - HORIZON_EMA_ALPHA) * y_prev
+                            max_step = HORIZON_MAX_STEP_RATIO * h
+                            y_ema = float(np.clip(y_ema, y_prev - max_step, y_prev + max_step))
+                            y_prev = y_ema
+                            miss_count = 0
+                        else:
+                            miss_count += 1
+                    else:
+                        miss_count += 1
+
+                if miss_count > HORIZON_MAX_MISS:
+                    y_prev = float(h * ROI_TOP_Y_RATIO)
+                    miss_count = 0
+                y_top = y_prev + HORIZON_TOP_MARGIN_RATIO * h
+                top_ratio = float(
+                    np.clip(
+                        y_top / h,
+                        HORIZON_TOP_MIN_RATIO,
+                        min(HORIZON_TOP_MAX_RATIO, ROI_BOTTOM_Y_RATIO - 0.05),
+                    )
+                )
+
+            mask = make_mask(w, h, top_ratio)
             bg = np.full_like(frame, BG_VALUE)
             infer_frame = np.where(mask[..., None] == 255, frame, bg)
             result = model.predict(
@@ -146,7 +287,10 @@ def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
         write_yolo_txt(lbl_dir / f"{p.stem}.txt", boxes, w, h)
         cv2.imwrite(str(img_dir / p.name), vis)
         if i % 100 == 0:
-            print(f"[{mode_dir.name}] {i}/{len(frames)}")
+            if hybrid:
+                print(f"[{mode_dir.name}] {i}/{len(frames)} top_y={top_ratio:.3f} miss={miss_count}")
+            else:
+                print(f"[{mode_dir.name}] {i}/{len(frames)}")
 
 
 def main() -> None:

@@ -15,6 +15,9 @@ from src.io_yolo import parse_yolo_txt
 
 @dataclass
 class EvalResult:
+    tp: int
+    fp: int
+    fn: int
     precision: float
     recall: float
     f1: float
@@ -141,7 +144,7 @@ def eval_mode(pred_dir: Path, gt_dir: Path) -> EvalResult:
     aps = [ap_for_iou(pred_map, gt_map, float(t)) for t in ious]
     map50 = aps[0] if aps else 0.0
     map50_95 = float(np.mean(aps)) if aps else 0.0
-    return EvalResult(precision, recall, f1, map50, map50_95, fp)
+    return EvalResult(tp, fp, fn, precision, recall, f1, map50, map50_95, fp)
 
 
 def main() -> None:
@@ -162,7 +165,7 @@ def main() -> None:
     write_csv(
         REPORTS_DIR / "metrics.csv",
         rows,
-        fieldnames=["mode", "precision", "recall", "f1", "map50", "map50_95", "fp_count"],
+        fieldnames=["mode", "tp", "fp", "fn", "precision", "recall", "f1", "map50", "map50_95", "fp_count"],
     )
     print("[done] reports/metrics.json and reports/metrics.csv")
 
