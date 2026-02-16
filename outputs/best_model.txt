@@ -1,0 +1,1 @@
+/scratch/yangximing/code/ass4-exp/outputs/runs/yolo26s/weights/best.pt
