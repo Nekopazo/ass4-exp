@@ -66,11 +66,16 @@ def detection_matrix_plot(row: dict, out_name: str):
 def main():
     ensure_dir(PLOTS_DIR)
     rows = load_metrics()
-    barplot(rows, "map50_95", "mAP@0.5:0.95 Comparison", "map_comparison.png")
-    barplot(rows, "f1", "F1 Comparison", "f1_comparison.png")
-    barplot(rows, "fp_count", "FP Count Comparison", "fp_comparison.png")
-    for r in rows:
-        detection_matrix_plot(r, f"matrix_{r['mode']}.png")
+    clips = sorted({r.get("clip", "default") for r in rows})
+    for clip in clips:
+        clip_rows = [r for r in rows if r.get("clip", "default") == clip]
+        if not clip_rows:
+            continue
+        barplot(clip_rows, "map50_95", f"mAP@0.5:0.95 Comparison ({clip})", f"map_comparison_{clip}.png")
+        barplot(clip_rows, "f1", f"F1 Comparison ({clip})", f"f1_comparison_{clip}.png")
+        barplot(clip_rows, "fp_count", f"FP Count Comparison ({clip})", f"fp_comparison_{clip}.png")
+        for r in clip_rows:
+            detection_matrix_plot(r, f"matrix_{clip}_{r['mode']}.png")
     print("[done] reports/plots generated")
 
 

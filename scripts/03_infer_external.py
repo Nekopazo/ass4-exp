@@ -201,11 +201,26 @@ def hybrid_filter(boxes: list[dict], mask: np.ndarray, width: int, height: int) 
     return kept
 
 
-def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
-    img_dir = ensure_dir(mode_dir / "images")
-    lbl_dir = ensure_dir(mode_dir / "labels")
+def discover_frame_dirs() -> list[Path]:
+    # Backward compatible: single clip path.
+    dirs = []
+    if EXTERNAL_FRAMES_DIR.exists():
+        dirs.append(EXTERNAL_FRAMES_DIR)
 
-    frames = sorted(EXTERNAL_FRAMES_DIR.glob("*.jpg"))
+    # Multi-clip mode: video-frame1/frames, video-frame2/frames, ...
+    root = EXTERNAL_FRAMES_DIR.parent.parent
+    for p in sorted(root.glob("video-frame*/frames")):
+        if p.exists() and p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def run_mode_for_clip(model: YOLO, mode_dir: Path, clip_name: str, frames_dir: Path, hybrid: bool) -> None:
+    img_dir = ensure_dir(mode_dir / clip_name / "images")
+    lbl_dir = ensure_dir(mode_dir / clip_name / "labels")
+    pre_dir = ensure_dir(mode_dir / clip_name / "pre_yolo") if hybrid else None
+
+    frames = sorted(frames_dir.glob("*.jpg"))
     y_prev = None
     miss_count = 0
     y_hist = deque(maxlen=HORIZON_MEDIAN_WIN)
@@ -261,6 +276,8 @@ def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
             mask = make_mask(w, h, top_ratio)
             bg = np.full_like(frame, BG_VALUE)
             infer_frame = np.where(mask[..., None] == 255, frame, bg)
+            if pre_dir is not None:
+                cv2.imwrite(str(pre_dir / p.name), infer_frame)
             result = model.predict(
                 source=infer_frame,
                 conf=CONF_THRES,
@@ -288,9 +305,12 @@ def run_mode(model: YOLO, mode_dir: Path, hybrid: bool) -> None:
         cv2.imwrite(str(img_dir / p.name), vis)
         if i % 100 == 0:
             if hybrid:
-                print(f"[{mode_dir.name}] {i}/{len(frames)} top_y={top_ratio:.3f} miss={miss_count}")
+                print(
+                    f"[{mode_dir.name}/{clip_name}] {i}/{len(frames)} "
+                    f"top_y={top_ratio:.3f} miss={miss_count}"
+                )
             else:
-                print(f"[{mode_dir.name}] {i}/{len(frames)}")
+                print(f"[{mode_dir.name}/{clip_name}] {i}/{len(frames)}")
 
 
 def main() -> None:
@@ -300,8 +320,14 @@ def main() -> None:
     model_path = Path(BEST_MODEL_FILE.read_text(encoding="utf-8").strip())
     model = YOLO(str(model_path))
     print(f"[model] {model_path}")
-    run_mode(model, NO_HYBRID_DIR, hybrid=False)
-    run_mode(model, HYBRID_DIR, hybrid=True)
+    frame_dirs = discover_frame_dirs()
+    if not frame_dirs:
+        raise FileNotFoundError("No clip frames directory found.")
+    print("[clips]", ", ".join(str(p.parent.name) for p in frame_dirs))
+    for frames_dir in frame_dirs:
+        clip_name = frames_dir.parent.name
+        run_mode_for_clip(model, NO_HYBRID_DIR, clip_name, frames_dir, hybrid=False)
+        run_mode_for_clip(model, HYBRID_DIR, clip_name, frames_dir, hybrid=True)
     print("[done] external inference complete")
 
 

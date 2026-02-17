@@ -126,9 +126,25 @@ def load_map(label_dir: Path) -> dict[str, list[dict]]:
     return out
 
 
-def eval_mode(pred_dir: Path, gt_dir: Path) -> EvalResult:
-    pred_map = load_map(pred_dir)
-    gt_map = load_map(gt_dir)
+def load_map_from_frames(frames_dir: Path, label_dir: Path) -> dict[str, list[dict]]:
+    out = {}
+    for img_path in sorted(frames_dir.glob("*.jpg")):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        txt = label_dir / f"{img_path.stem}.txt"
+        out[img_path.stem] = parse_yolo_txt(txt, w, h)
+    return out
+
+
+def eval_mode(pred_dir: Path, gt_dir: Path, frames_dir: Path | None = None) -> EvalResult:
+    if frames_dir is None:
+        pred_map = load_map(pred_dir)
+        gt_map = load_map(gt_dir)
+    else:
+        pred_map = load_map_from_frames(frames_dir, pred_dir)
+        gt_map = load_map_from_frames(frames_dir, gt_dir)
 
     tp = fp = fn = 0
     for k in gt_map.keys():
@@ -147,25 +163,47 @@ def eval_mode(pred_dir: Path, gt_dir: Path) -> EvalResult:
     return EvalResult(tp, fp, fn, precision, recall, f1, map50, map50_95, fp)
 
 
-def main() -> None:
-    gt_dir = EXTERNAL_LABELS_DIR
-    no_h = eval_mode(NO_HYBRID_DIR / "labels", gt_dir)
-    hyb = eval_mode(HYBRID_DIR / "labels", gt_dir)
+def discover_clips() -> list[tuple[str, Path, Path]]:
+    # (clip_name, frames_dir, gt_labels_dir)
+    clips = []
+    root = EXTERNAL_FRAMES_DIR.parent.parent
+    candidates = sorted(root.glob("video-frame*"))
+    for c in candidates:
+        f = c / "frames"
+        g = c / "output"
+        if f.exists() and g.exists():
+            clips.append((c.name, f, g))
+    if clips:
+        return clips
+    # fallback to legacy single-dir mode
+    if EXTERNAL_FRAMES_DIR.exists() and EXTERNAL_LABELS_DIR.exists():
+        clips.append(("default", EXTERNAL_FRAMES_DIR, EXTERNAL_LABELS_DIR))
+    return clips
 
-    result = {
-        "no_hybrid": no_h.__dict__,
-        "hybrid": hyb.__dict__,
-    }
+
+def main() -> None:
+    clips = discover_clips()
+    if not clips:
+        raise FileNotFoundError("No clip directories found for evaluation.")
+
+    result = {}
+    rows = []
+    for clip_name, frames_dir, gt_dir in clips:
+        no_h = eval_mode(NO_HYBRID_DIR / clip_name / "labels", gt_dir, frames_dir=frames_dir)
+        hyb = eval_mode(HYBRID_DIR / clip_name / "labels", gt_dir, frames_dir=frames_dir)
+        result[clip_name] = {
+            "no_hybrid": no_h.__dict__,
+            "hybrid": hyb.__dict__,
+        }
+        rows.append({"clip": clip_name, "mode": "no_hybrid", **no_h.__dict__})
+        rows.append({"clip": clip_name, "mode": "hybrid", **hyb.__dict__})
+
     ensure_dir(REPORTS_DIR)
     write_json(REPORTS_DIR / "metrics.json", result)
-    rows = [
-        {"mode": "no_hybrid", **no_h.__dict__},
-        {"mode": "hybrid", **hyb.__dict__},
-    ]
     write_csv(
         REPORTS_DIR / "metrics.csv",
         rows,
-        fieldnames=["mode", "tp", "fp", "fn", "precision", "recall", "f1", "map50", "map50_95", "fp_count"],
+        fieldnames=["clip", "mode", "tp", "fp", "fn", "precision", "recall", "f1", "map50", "map50_95", "fp_count"],
     )
     print("[done] reports/metrics.json and reports/metrics.csv")
 
